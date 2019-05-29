@@ -3,13 +3,321 @@
 
 <head>
   <title>js-keygen</title>
-  <script>module = {};</script>
-  <script src="base64url.js"></script>
-  <script src="ssh-util.js"></script>
-  <script src="js-keygen-ui.js"></script>
-  <script src="js-keygen.js"></script>
-  <link rel="stylesheet" href="js-keygen.css">
-  <link rel="icon" type="image/png" href="key.png">
+  <script>
+// adapted from https://tools.ietf.org/html/draft-ietf-jose-json-web-signature-08#appendix-C
+
+function base64urlEncode(arg) {
+  const step1 = window.btoa(arg); // Regular base64 encoder
+  const step2 = step1.split("=")[0]; // Remove any trailing '='s
+  const step3 = step2.replace(/\+/g, "-"); // 62nd char of encoding
+  const step4 = step3.replace(/\//g, "_"); // 63rd char of encoding
+  return step4;
+}
+
+function base64urlDecode(s) {
+  const step1 = s.replace(/-/g, "+"); // 62nd char of encoding
+  const step2 = step1.replace(/_/g, "/"); // 63rd char of encoding
+  let step3 = step2;
+  switch (step2.length % 4) { // Pad with trailing '='s
+    case 0: // No pad chars in this case
+      break;
+    case 2: // Two pad chars
+      step3 += "==";
+      break;
+    case 3: // One pad char
+      step3 += "=";
+      break;
+    default:
+      throw new Error("Illegal base64url string!");
+  }
+  return window.atob(step3); // Regular base64 decoder
+}
+
+function arrayToString(a) {
+  return String.fromCharCode.apply(null, a);
+}
+
+function stringToArray(s) {
+  return s.split("").map(c => c.charCodeAt());
+}
+
+function base64urlToArray(s) {
+  return stringToArray(base64urlDecode(s));
+}
+
+function pemToArray(pem) {
+  return stringToArray(window.atob(pem));
+}
+
+function arrayToPem(a) {
+  return window.btoa(a.map(c => String.fromCharCode(c)).join(""));
+}
+
+function arrayToLen(a) {
+  let result = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    result = result * 256 + a[i];
+  }
+  return result;
+}
+
+function integerToOctet(n) {
+  const result = [];
+  for (let i = n; i > 0; i >>= 8) {
+    result.push(i & 0xff);
+  }
+  return result.reverse();
+}
+
+function lenToArray(n) {
+  const oct = integerToOctet(n);
+  let i;
+  for (i = oct.length; i < 4; i += 1) {
+    oct.unshift(0);
+  }
+  return oct;
+}
+
+function decodePublicKey(s) {
+  const split = s.split(" ");
+  const prefix = split[0];
+  if (prefix !== "ssh-rsa") {
+    throw new Error(`Unknown prefix: ${prefix}`);
+  }
+  const buffer = pemToArray(split[1]);
+  const nameLen = arrayToLen(buffer.splice(0, 4));
+  const type = arrayToString(buffer.splice(0, nameLen));
+  if (type !== "ssh-rsa") {
+    throw new Error(`Unknown key type: ${type}`);
+  }
+  const exponentLen = arrayToLen(buffer.splice(0, 4));
+  const exponent = buffer.splice(0, exponentLen);
+  const keyLen = arrayToLen(buffer.splice(0, 4));
+  const key = buffer.splice(0, keyLen);
+  return { type, exponent, key, name: split[2] };
+}
+
+function checkHighestBit(v) {
+  if (v[0] >> 7 === 1) {
+    // add leading zero if first bit is set
+    v.unshift(0);
+  }
+  return v;
+}
+
+function jwkToInternal(jwk) {
+  return {
+    type: "ssh-rsa",
+    exponent: checkHighestBit(stringToArray(base64urlDecode(jwk.e))),
+    name: "name",
+    key: checkHighestBit(stringToArray(base64urlDecode(jwk.n))),
+  };
+}
+
+function encodePublicKey(jwk, name) {
+  const k = jwkToInternal(jwk);
+  k.name = name;
+  const keyLenA = lenToArray(k.key.length);
+  const exponentLenA = lenToArray(k.exponent.length);
+  const typeLenA = lenToArray(k.type.length);
+  const array = [].concat(typeLenA, stringToArray(k.type), exponentLenA, k.exponent, keyLenA, k.key);
+  const encoding = arrayToPem(array);
+  return `${k.type} ${encoding} ${k.name}`;
+}
+
+function asnEncodeLen(n) {
+  let result = [];
+  if (n >> 7) {
+    result = integerToOctet(n);
+    result.unshift(0x80 + result.length);
+  } else {
+    result.push(n);
+  }
+  return result;
+}
+
+function encodePrivateKey(jwk) {
+  const order = ["n", "e", "d", "p", "q", "dp", "dq", "qi"];
+  const list = order.map(prop => {
+    const v = checkHighestBit(stringToArray(base64urlDecode(jwk[prop])));
+    const len = asnEncodeLen(v.length);
+    return [0x02].concat(len, v); // int tag is 0x02
+  });
+  let seq = [0x02, 0x01, 0x00]; // extra seq for SSH
+  seq = seq.concat(...list);
+  const len = asnEncodeLen(seq.length);
+  const a = [0x30].concat(len, seq); // seq is 0x30
+  return arrayToPem(a);
+}
+
+var generateKeyPair;
+
+function copy(id) {
+  return function() {
+    var ta = document.querySelector(id);
+    ta.focus();
+    ta.select();
+    try {
+      var successful = document.execCommand("copy");
+      var msg = successful ? "successful" : "unsuccessful";
+      console.log("Copy key command was " + msg);
+    } catch (err) {
+      console.log("Oops, unable to copy");
+    }
+    window.getSelection().removeAllRanges();
+    ta.blur();
+  };
+}
+
+function buildHref(data) {
+  return "data:application/octet-stream;charset=utf-8;base64," + window.btoa(data);
+}
+
+document.addEventListener("DOMContentLoaded", function() {
+  document.querySelector("#savePrivate").addEventListener("click", function() {
+    document.querySelector("a#private").click();
+  });
+  document.querySelector("#copyPrivate").addEventListener("click", copy("#privateKey"));
+  document.querySelector("#savePublic").addEventListener("click", function() {
+    document.querySelector("a#public").click();
+  });
+  document.querySelector("#copyPublic").addEventListener("click", copy("#publicKey"));
+
+  document.querySelector("#generate").addEventListener("click", function() {
+    var name = document.querySelector("#name").value || "name";
+    document.querySelector("a#private").setAttribute("download", name + "_rsa");
+    document.querySelector("a#public").setAttribute("download", name + "_rsa.pub");
+
+    var alg = document.querySelector("#alg").value || "RSASSA-PKCS1-v1_5";
+    var size = parseInt(document.querySelector("#size").value || "2048", 10);
+    var hash = document.querySelector('#hash').value || 'SHA-1';
+    generateKeyPair(alg, size, hash, name)
+      .then(function(keys) {
+        document.querySelector("#private").setAttribute("href", buildHref(keys[0]));
+        document.querySelector("#public").setAttribute("href", buildHref(keys[1]));
+        document.querySelector("#privateKey").textContent = keys[0];
+        document.querySelector("#publicKey").textContent = keys[1];
+        document.querySelector("#result").style.display = "block";
+      })
+      .catch(function(err) {
+        console.error(err);
+      });
+  });
+});
+
+const extractable = true;
+
+function wrap(text, len) {
+  const length = len || 72;
+  let result = "";
+  for (let i = 0; i < text.length; i += length) {
+    result += text.slice(i, i + length);
+    result += "\n";
+  }
+  return result;
+}
+
+function rsaPrivateKey(key) {
+  return `-----BEGIN RSA PRIVATE KEY-----\n${key}-----END RSA PRIVATE KEY-----`;
+}
+
+function arrayBufferToBase64(buffer) {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return window.btoa(binary);
+}
+
+function generateKeyPair(alg, size, hash, name) {
+  return window.crypto.subtle
+    .generateKey(
+      {
+        name: alg,
+        modulusLength: size, // can be 1024, 2048, or 4096
+        publicExponent: new Uint8Array([0x01, 0x00, 0x01]),
+        hash: { name: hash }, // can be "SHA-1", "SHA-256", "SHA-384", or "SHA-512"
+      },
+      extractable,
+      ["sign", "verify"]
+    )
+    .then(key => {
+      const privateKey = window.crypto.subtle
+        .exportKey("jwk", key.privateKey)
+        .then(encodePrivateKey)
+        .then(wrap)
+        .then(rsaPrivateKey);
+
+      const publicKey = window.crypto.subtle.exportKey("jwk", key.publicKey).then(jwk => encodePublicKey(jwk, name));
+      return Promise.all([privateKey, publicKey]);
+    });
+}
+
+</script>
+
+  <style>
+.https_warning {
+    color: #800;
+    font-weight: bold;
+}
+
+.donations_area {
+        font-size: 0.7em;
+}
+
+.address {
+    font-family: monospace;
+}
+
+body {
+  background-color: #cccccc;
+  font: 16px Arial, Tahoma, Helvetica, FreeSans, sans-serif;
+}
+
+button#generate {
+  background-color: rgb(60, 200, 30);
+  padding: 10px;
+  margin-top: 5px;
+  color: white;
+  font-weight: bold;
+  font-size: 1.1em;
+  border-radius: 8px;
+  border-width: 0px;
+  margin-right: 20px;
+  margin-left: 20px;
+  min-width: 120px;
+}
+
+div#content {
+  background-color: #f0f0f0;
+  border-radius: 8px;
+  width: 780px;
+  margin: auto;
+  padding: 20px;
+}
+
+label {
+  display: inline-block;
+  width: 80px;
+}
+select {
+  width: 200px;
+}
+input {
+  width: 180px;
+}
+textarea {
+  margin-top: 10px;
+  width: 650px;
+  height: 70px;
+  word-wrap: break-word;
+  font-family: monospace;
+  overflow: scroll;
+}
+
+  </style>
 </head>
 
 <body>
@@ -23,31 +331,27 @@
     <br> Usually you would want to save the private key to the machine initiating the ssh connection, and you want to copy the
     public key to the system receiving the connection.
     <br> No data is being sent to the server, everything happens within the context of this web page.
-    <br>
-    <a href="https://twitter.com/share" class="twitter-share-button" data-via="pkr2">Tweet</a>
-    <script>!function (d, s, id) { var js, fjs = d.getElementsByTagName(s)[0], p = /^http:/.test(d.location) ? 'http' : 'https'; if (!d.getElementById(id)) { js = d.createElement(s); js.id = id; js.src = p + '://platform.twitter.com/widgets.js'; fjs.parentNode.insertBefore(js, fjs); } }(document, 'script', 'twitter-wjs');</script>
     <hr>
     <div>
       <label for="name">Name:</label>
-      <input id="name" type="text" value="webcrypto">
+      <input id="name" type="text" value="js_keygen">
     </div>
     <div>
       <label for="alg">Algorithm:</label>
-      <select id="alg" disabled>
+      <select id="alg">
         <option value="RSASSA-PKCS1-v1_5" selected>RSASSA-PKCS1-v1_5</option>
         <option value="RSA-PSS">RSA-PSS</option>
-        <option value="ECDSA">ECDSA</option>
       </select>
       <label for="size">Size:</label>
-      <select id="size" disabled>
-        <option value="1024" selected>1024</option>
-        <option value="2048">2048</option>
+      <select id="size">
+        <option value="1024">1024</option>
+        <option value="2048" selected>2048</option>
         <option value="4096">4096</option>
       </select>
     </div>
     <div>
       <label for="hash">Hash:</label>
-      <select id="hash" disabled>
+      <select id="hash">
         <option value="SHA-1" selected>SHA-1</option>
         <option value="SHA-256">SHA-256</option>
         <option value="SHA-384">SHA-384</option>
@@ -56,6 +360,7 @@
     </div>
     <label for="generate"></label>
     <button id="generate">Generate</button>
+    <div class="https_warning" id="https-warning"></div>
     <br>
 
     <div id="result" style="display:none;">
@@ -74,14 +379,26 @@
       <br>
       <textarea id="publicKey" spellcheck="false"></textarea>
     </div>
-    <hr> Made with
-    <span style="color:magenta;">&hearts;</span> by
-    <a href="http://blog.roumanoff.com">Patrick Roumanoff</a>
-    <a href="https://github.com/PatrickRoumanoff/js-keygen">
-      <img style="position: absolute; top: 0; right: 0; border: 0;" src="https://camo.githubusercontent.com/365986a132ccd6a44c23a9169022c0b5c890c387/68747470733a2f2f73332e616d617a6f6e6177732e636f6d2f6769746875622f726962626f6e732f666f726b6d655f72696768745f7265645f6161303030302e706e67"
-        alt="Fork me on GitHub" data-canonical-src="https://s3.amazonaws.com/github/ribbons/forkme_right_red_aa0000.png">
-    </a>
+    <hr> Original version coded by <a href="http://blog.roumanoff.com">Patrick Roumanoff</a>
+    <br> Repackaged, fixed, and hosted by <a href="mailto:cplasmaguns@hotmail.com">cplasmaguns</a> for portability and easy downloading.
+
+    <p> <a href="http://matvore.ddns.net">Home</a>
+
+    <div class="donations_area">
+    <br> Donations for cplasmaguns are welcome:
+    <br> <strong>BTC</strong> <span class="address">36KNnXm2or281Fwyc1eTmyHZusLS6Ga1DN</span>
+    <br> <strong>ETH</strong> <span class="address">0x8d77026817F4ffbd3d57c221920EDdcA48ae8c67</span>
+    <br> <strong>LTC</strong> <span class="address">MR21kVQdLZSzdoV9wtV9EApHJM2HH9wWrF</span>
+    <br> <strong>DOGE</strong> <span class="address">DS2bmyLjRUax4uygswKzW4G39ifcCTg2Vx</span>
+    </div>
   </div>
+
+  <script>
+    if (!window.crypto.subtle) {
+        // Go to a mirror which has SSL support.
+        window.location.replace('https://scito.surge.sh/js-keygen.html');
+    }
+  </script>
 </body>
 
 </html>
